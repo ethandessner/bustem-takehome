@@ -357,7 +357,7 @@ export function aggregateScore(
     allReasons.push({
       signal: "imageSimilarity",
       score: 0,
-      explanation: "Image fetch failed or budget exhausted — signal skipped (does not lower the score).",
+      explanation: "Image similarity not included — it can only raise a score, so its absence never lowers this one.",
     });
   } else {
     const imgPct = Math.round(signals.imageSimilarity * 100);

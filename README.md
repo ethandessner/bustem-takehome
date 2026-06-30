@@ -35,7 +35,9 @@ The job store is a plain `Map` on `globalThis`, which survives Next.js hot reloa
 
 ## What queries are used
 
-Six distinct search terms are generated from known Comfrt product names:
+Ten distinct search terms are used — eight product-line terms plus two
+infringement-intent terms that surface knock-offs tagged "dupe"/"inspired"
+rather than the exact brand name:
 
 | Query | Purpose |
 |---|---|
@@ -45,8 +47,13 @@ Six distinct search terms are generated from known Comfrt product names:
 | `comfrt pullover` | Pullover variants |
 | `comfrt matching set` | Lounge set variants |
 | `comfrt cloud hoodie` | Cloud Hoodie line |
+| `comfrt crewneck` | Crewneck line |
+| `comfrt joggers` | Sweatpants / joggers |
+| `comfrt dupe` | Knock-offs marketed as dupes |
+| `comfrt inspired hoodie` | "Inspired by" imitations |
 
-Each query runs on **both Amazon and eBay**, across **page 1 and page 2**, producing **24 total search requests** per job. See `lib/search/queries.ts`.
+Each query runs on **both Amazon and eBay**, across **pages 1–3**, producing
+**60 total search requests** per job. See `lib/search/queries.ts`.
 
 ---
 
@@ -65,7 +72,7 @@ Each listing is scored with four independent signals. The final score is a 0–1
 | **Brand Mention** | Base weight **45%** | Exact "comfrt" in title → 1.0; in brand/description → 0.8; fuzzy match by Levenshtein edit-distance 1 → 0.65, distance 2 → 0.3; known legitimate brand (Nike, Adidas, etc.) → 0.0 |
 | **Text Similarity** | Base weight **30%** | Jaccard token-overlap between the listing title and every known Comfrt product name and keyword. Returns the best match (0–1). |
 | **Risk Heuristic** | Base weight **25%** | Combines price anomaly (apparel < $20 → 0.85, < $30 → 0.55), suspicious title terms ("dupe", "replica", "inspired by", …) → 0.75, suspicious seller patterns ("dropship", "wholesale", "factory", …) → 0.70, and digits-in-seller-name → 0.35. The explanation lists every trigger. |
-| **Image Similarity** | One-directional **floor** | Embeds the listing image with **CLIP (ViT-B/32)** via `@huggingface/transformers`, then takes the max cosine similarity against the cached Comfrt reference-image embeddings. Calibrated so only genuinely close visual matches score high (see below). Returns `null` if the image can't be fetched. |
+| **Image Similarity** | One-directional **floor** | Embeds the listing image with **CLIP (ViT-B/32)** via `@huggingface/transformers`, then takes the max cosine similarity against the cached Comfrt reference-image embeddings. Calibrated as a near-duplicate detector (see below). Returns `null` if the image can't be fetched. |
 
 ### Final score calculation
 
@@ -74,11 +81,11 @@ base  = (brandMention×0.45 + textSimilarity×0.30 + riskHeuristic×0.25)   // r
 score = max(base, imageSimilarity × 0.95)                                // image only RAISES the score
 ```
 
-Brand, text, and risk form a renormalised weighted average — these are *symmetric* signals where a low value genuinely points toward a legitimate listing. **Image similarity is treated asymmetrically:** a high value is strong proof a listing reuses a Comfrt photo, but a low value is uninformative (counterfeiters shoot their own photos). So image similarity is applied as a one-directional **floor** — it can only push the score *up*, never dilute it. This lets a brandless counterfeit with a copied photo still get flagged, while a genuine listing whose photo simply doesn't match keeps its brand/text/risk score instead of being dragged down.
+Brand, text, and risk form a renormalised weighted average — these are *symmetric* signals where a low value genuinely points toward a legitimate listing. **Image similarity is treated asymmetrically:** a high value is strong evidence a listing reuses a Comfrt photo, but a low value is uninformative (counterfeiters shoot their own photos). So it is applied as a one-directional **floor** — it can only push the score *up*, never dilute it. This lets a counterfeit with a copied photo still get flagged, while a genuine listing whose photo simply doesn't match keeps its brand/text/risk score instead of being dragged down.
 
-If `imageSimilarity` is `null` (fetch failed or budget/deadline reached), it's simply skipped — the base score stands, and the UI notes that the image signal was unavailable.
+If `imageSimilarity` is `null` (fetch failed or budget/deadline reached), it's simply skipped — the base score stands, and the UI notes the signal's status (pending / skipped / failed).
 
-**Why CLIP instead of a perceptual hash?** A pHash/dHash only matches near-identical *pixels*. CLIP embeddings capture *semantic* content, so a counterfeit shot from a different angle, on a different model, against a different background still lands close to the reference in embedding space. Because any hoodie scores ~0.80 cosine against a Comfrt hoodie, the raw cosine is calibrated with a noise floor of 0.78 and a match ceiling of 0.90 (`lib/scoring/imageSimilarity.ts`) so only genuinely close matches drive the score up.
+**Why CLIP, and why calibrated as a near-duplicate detector?** A pHash/dHash only matches near-identical *pixels*; CLIP embeddings capture *semantic* content. But a measured sample showed the limit of whole-image similarity here: generic non-Comfrt hoodies score cosine up to ~0.85 against the (on-model) references, overlapping the ~0.74–0.87 band of genuine Comfrt products shot differently. CLIP simply can't tell a Comfrt hoodie from any grey hoodie-on-a-model. So the calibration (`NOISE_FLOOR = 0.80`, `MATCH_CEILING = 0.92` in `lib/scoring/imageSimilarity.ts`) sits at the top of the negative band: a worst-case generic hoodie (~0.85) maps to ~40 (below the 75 "high match" line), while a reused/near-identical product photo (~0.90+) raises the score toward 79–100. Detecting "is it Comfrt" is left to the brand and text signals; image detects "is this literally Comfrt's photo".
 
 **Interpreting scores:**
 - **≥ 75** — High risk (likely infringing)
@@ -95,7 +102,7 @@ Every result exposes three things in the UI: the final score, the top human-read
 
 **Two concurrency lanes.** Searches and scoring run on independent semaphores (`lib/utils/concurrency.ts`): up to **4** in-flight searches and **6** in-flight scoring tasks. Keeping them separate is what makes results stream — scoring a freshly scraped listing starts immediately rather than waiting behind every remaining search — and it avoids the deadlock a single shared lane would create.
 
-**Soft request budget.** A cap of **250 total outbound requests** per job (24 search + image fetches for scoring) is enforced via a counter (`lib/utils/requestBudget.ts`). When reached, remaining listings are skipped and the UI shows a "Request budget reached" notice. Adjust via `REQUEST_BUDGET` in `lib/jobs/runner.ts`.
+**Soft request budget.** A cap of **120 total outbound requests** per job (search + image fetches share the budget; searches run first) is enforced via a counter (`lib/utils/requestBudget.ts`), matching the spec's suggested ~120. When reached, remaining listings are skipped and the UI shows a "Request budget reached" notice. Adjust via `REQUEST_BUDGET` in `lib/jobs/runner.ts`.
 
 **Wall-clock deadline.** A soft **4-minute** deadline (`JOB_DEADLINE_MS`) stops scheduling new search/scoring work once elapsed, so a large budget can't let a job run indefinitely. In-flight tasks finish (their own 15 s fetch timeouts bound the overrun).
 

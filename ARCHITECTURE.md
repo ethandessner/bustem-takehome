@@ -50,7 +50,7 @@ Workers tag every outbound request with a `clientId` and check/decrement the app
 | `clients` | id, name, tier, api_key_hash | One row per brand-protection customer |
 | `brands` | id, client_id, name, keywords[] | A client may protect multiple brands |
 | `reference_products` | id, brand_id, name, price_min, price_max | Known canonical products |
-| `reference_images` | id, product_id, url, dhash, phash | Pre-computed hashes stored here, not recomputed per job |
+| `reference_images` | id, product_id, url, embedding (vector) | Pre-computed CLIP embeddings stored here (e.g. pgvector), not recomputed per job |
 | `jobs` | id, client_id, brand_id, status, started_at, completed_at, budget_used, error | One row per scan |
 | `marketplace_queries` | id, job_id, marketplace, query, page, status, error | One row per search request; enables retry |
 | `raw_results` | id, job_id, marketplace, external_id, title, price, seller, image_url, fetched_at | Deduplicated raw listing data |
@@ -59,12 +59,12 @@ Workers tag every outbound request with a `clientId` and check/decrement the app
 ### Object storage (S3 / GCS)
 
 - **Image artifacts** — listing images fetched during scoring are cached by URL hash. Subsequent jobs reuse the cached copy, avoiding re-fetching the same image.
-- **Image hashes** — dHash and pHash values for both reference and listing images are stored alongside the raw bytes.
+- **Image embeddings** — the CLIP (ViT-B/32) embedding vectors computed for both reference and listing images are persisted (in pgvector or a dedicated vector store), so a listing seen again is never re-embedded.
 
 ### Cache (Redis)
 
 - Rate-limit counters (per client, per marketplace)
-- Reference image hashes (hot path — avoid a DB round-trip per listing)
+- Reference image embeddings (hot path — avoid a DB/vector round-trip per listing)
 - Job state for the polling endpoint (avoid hitting Postgres on every 1.5 s poll)
 
 ---

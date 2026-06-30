@@ -14,20 +14,27 @@ export interface SearchQuery {
  * counterfeit sellers to surface in marketplace search results.
  */
 export const DISTINCT_QUERIES = [
+  // Product-line terms — broad coverage of the catalog counterfeiters copy
   "comfrt hoodie",
   "comfrt sweatshirt",
   "comfrt sweatsuit",
   "comfrt pullover",
   "comfrt matching set",
   "comfrt cloud hoodie",
+  "comfrt crewneck",
+  "comfrt joggers",
+  // Infringement-intent terms — surface the long tail of knock-offs that
+  // sellers tag with "dupe"/"inspired" rather than the exact brand name
+  "comfrt dupe",
+  "comfrt inspired hoodie",
 ] as const;
 
 const MARKETPLACES: Marketplace[] = ["amazon", "ebay"];
-const PAGES_PER_QUERY = 2;
+const PAGES_PER_QUERY = 3;
 
 /**
  * Generates the full set of search queries: each distinct query × each
- * marketplace × each page. Total: 6 queries × 2 markets × 2 pages = 24 requests.
+ * marketplace × each page. Total: 10 queries × 2 markets × 3 pages = 60 requests.
  */
 export function generateSearchQueries(): SearchQuery[] {
   const queries: SearchQuery[] = [];
