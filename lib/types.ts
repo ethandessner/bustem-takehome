@@ -59,6 +59,16 @@ export interface ScoreReason {
   explanation: string;
 }
 
+/**
+ * Lifecycle of the (expensive) image-similarity signal for a result:
+ *  - "pending" — base signals are scored and posted; CLIP embedding is queued
+ *  - "scored"  — image embedding completed and is reflected in the score
+ *  - "skipped" — image not run (no image URL, base score already conclusive,
+ *                or the budget/deadline was reached before it could run)
+ *  - "failed"  — image fetch/embedding was attempted but errored
+ */
+export type ImageStatus = "pending" | "scored" | "skipped" | "failed";
+
 export interface ScoredResult {
   result: MarketplaceResult;
   /** 0–100 infringement probability (scaled from 0–1 weighted average) */
@@ -66,4 +76,6 @@ export interface ScoredResult {
   signals: SignalScores;
   reasons: ScoreReason[];
   scoredAt: number;
+  /** Tracks whether the image signal has run; drives progressive enrichment UI */
+  imageStatus: ImageStatus;
 }

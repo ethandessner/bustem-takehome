@@ -1,18 +1,18 @@
-import type { MarketplaceResult } from "../types";
+import type { MarketplaceResult, ScoredResult } from "../types";
 import { searchAmazon } from "../search/amazon";
 import { searchEbay } from "../search/ebay";
 import { generateSearchQueries } from "../search/queries";
-import { scoreResult } from "../scoring";
+import { scoreBase, scoreResult } from "../scoring";
 import { ConcurrencyLimiter } from "../utils/concurrency";
 import { RequestBudget } from "../utils/requestBudget";
-import { addMarketplaceError, addResult, setBudgetExhausted, updateJobStatus, updateRequestCounts } from "./jobStore";
+import { addMarketplaceError, addResult, setBudgetExhausted, updateJobStatus, updateRequestCounts, upsertResult } from "./jobStore";
 
 /**
  * Soft limit on total outbound requests (search + image) per job.
- * 24 search requests (6 queries × 2 pages × 2 markets) + up to ~96 image
- * requests fits within this budget for a typical run.
+ * 60 search requests (10 queries × 3 pages × 2 markets) plus per-listing image
+ * fetches share this budget; searches run first, the rest goes to image scoring.
  */
-export const REQUEST_BUDGET = 250;
+export const REQUEST_BUDGET = 120;
 
 /**
  * Searches and scoring run on SEPARATE concurrency lanes so that scoring can
@@ -33,6 +33,18 @@ const SCORE_CONCURRENCY = 6;
  */
 const JOB_DEADLINE_MS = 4 * 60_000;
 
+/**
+ * Base-score threshold above which we skip the (expensive) image signal.
+ *
+ * Image similarity is a one-directional floor — it can only RAISE a score. A
+ * listing already scoring ≥ this on brand/text/risk is firmly in the "High
+ * risk" tier, and the image floor (max ~95) couldn't change that tier. So we
+ * reserve scarce CLIP inference time/budget for the borderline and low-base
+ * listings where a copied photo can actually change the ranking (e.g. brandless
+ * counterfeits reusing Comfrt product images).
+ */
+const IMAGE_SCORE_GATE = 75;
+
 export async function runJob(jobId: string): Promise<void> {
   updateJobStatus(jobId, "running");
 
@@ -52,31 +64,61 @@ export async function runJob(jobId: string): Promise<void> {
 
   const queries = generateSearchQueries();
 
-  // Scoring tasks are tracked so the job can await any in-flight scoring after
-  // all searches complete. They run on their own limiter, so pushing a task
-  // here lets it start immediately (interleaved with ongoing searches) and the
-  // result is posted the moment that single listing finishes scoring.
-  const scoringTasks: Array<Promise<void>> = [];
+  // Image-enrichment tasks are tracked so the job can await any in-flight image
+  // scoring after all searches/base-scoring complete. They run on their own
+  // limiter so the slow CLIP work never blocks the instant base scoring.
+  const imageTasks: Array<Promise<void>> = [];
 
-  const scoreListing = (listing: MarketplaceResult) =>
+  /**
+   * Phase 2: enrich an already-posted base result with the image signal,
+   * replacing it in place. Degrades to "skipped" if the deadline/budget hit
+   * before the image could run, so the UI never shows a stuck "pending".
+   */
+  const enrichWithImage = (listing: MarketplaceResult, base: ScoredResult) =>
     scoreLimiter.run(async () => {
-      if (pastDeadline()) return;
+      if (pastDeadline()) {
+        upsertResult(jobId, { ...base, imageStatus: "skipped" });
+        return;
+      }
       if (!budget.canMakeRequest()) {
         setBudgetExhausted(jobId);
+        upsertResult(jobId, { ...base, imageStatus: "skipped" });
         return;
       }
 
       try {
-        const scored = await scoreResult(listing, budget);
-        // Post each result as soon as it is scored and ranked.
-        addResult(jobId, scored);
+        const enriched = await scoreResult(listing, budget);
+        upsertResult(jobId, enriched);
       } catch (err) {
         console.warn(
-          `[runner] Scoring failed for listing ${listing.id}:`,
+          `[runner] Image scoring failed for listing ${listing.id}:`,
           err instanceof Error ? err.message : err
         );
+        upsertResult(jobId, { ...base, imageStatus: "failed" });
       }
     });
+
+  /**
+   * Phase 1: score the three instant signals and post the result immediately,
+   * so every scraped listing appears right away regardless of image throughput.
+   * Only listings where the image could change the ranking get queued for the
+   * slow CLIP pass.
+   */
+  const scoreListing = (listing: MarketplaceResult) => {
+    const base = scoreBase(listing, listing.imageUrl ? "pending" : "skipped");
+
+    const willScoreImage =
+      !!listing.imageUrl && base.totalScore < IMAGE_SCORE_GATE;
+
+    addResult(
+      jobId,
+      willScoreImage ? base : { ...base, imageStatus: "skipped" }
+    );
+
+    if (willScoreImage) {
+      imageTasks.push(enrichWithImage(listing, base));
+    }
+  };
 
   try {
     await Promise.all(
@@ -106,22 +148,23 @@ export async function runJob(jobId: string): Promise<void> {
             return;
           }
 
-          // Dedup at schedule time and kick off scoring immediately. Scoring
-          // runs on its own lane, so freshly scraped listings start scoring
-          // while later search pages are still being fetched.
+          // Dedup at schedule time, then score+post the base signals instantly
+          // and (if worthwhile) queue the slow image pass. Base results appear
+          // immediately while later search pages are still being fetched.
           for (const listing of listings) {
             const seenSet =
               listing.marketplace === "amazon" ? seenAmazon : seenEbay;
             if (seenSet.has(listing.id)) continue;
             seenSet.add(listing.id);
-            scoringTasks.push(scoreListing(listing));
+            scoreListing(listing);
           }
         })
       )
     );
 
-    // All searches done; wait for any in-flight/queued scoring to finish.
-    await Promise.all(scoringTasks);
+    // All searches and base scoring done; wait for any in-flight/queued image
+    // enrichment to finish (those past the deadline resolve immediately).
+    await Promise.all(imageTasks);
 
     updateJobStatus(jobId, "complete");
   } catch (err) {

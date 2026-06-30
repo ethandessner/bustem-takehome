@@ -1,6 +1,11 @@
-import type { MarketplaceResult, ScoredResult, SignalScores } from "../types";
+import type {
+  MarketplaceResult,
+  ScoreReason,
+  ScoredResult,
+  SignalScores,
+} from "../types";
 import type { RequestBudget } from "../utils/requestBudget";
-import { computeImageSimilarity } from "./imageSimilarity";
+import { analyzeListingImage } from "./imageSimilarity";
 import {
   aggregateScore,
   computeBrandMention,
@@ -9,43 +14,47 @@ import {
 } from "./signals";
 
 /**
- * Score a single marketplace listing with four independent signals:
- *   1. brandMention   — exact + fuzzy brand-name detection  (weight 0.30)
- *   2. textSimilarity — Jaccard overlap vs Comfrt products   (weight 0.20)
- *   3. imageSimilarity — dHash vs reference images           (weight 0.35)
- *   4. riskHeuristic  — price anomaly + suspicious language  (weight 0.15)
+ * Scoring uses four independent signals:
+ *   1. brandMention   — exact + fuzzy brand-name detection (base weight 0.45)
+ *   2. textSimilarity — Jaccard overlap vs Comfrt products  (base weight 0.30)
+ *   3. riskHeuristic  — price anomaly + suspicious language (base weight 0.25)
+ *   4. imageSimilarity — CLIP embedding similarity vs reference images
+ *      (applied as a one-directional floor — only ever raises the score)
  *
- * Image similarity failures degrade gracefully: the signal is null and its
- * weight is redistributed to the remaining three signals.
+ * The first three are synchronous and effectively instant. Image similarity is
+ * the only slow, network- + CPU-bound signal, so it is computed separately so
+ * the cheap base score can be posted immediately and enriched later.
  */
-export async function scoreResult(
-  listing: MarketplaceResult,
-  budget: RequestBudget
-): Promise<ScoredResult> {
+
+interface BaseSignals {
+  parts: Omit<SignalScores, "imageSimilarity">;
+  reasons: ScoreReason[];
+}
+
+/** Compute the three synchronous (cheap) signals for a listing. */
+function computeBaseSignals(listing: MarketplaceResult): BaseSignals {
   const brandResult = computeBrandMention(listing);
   const textResult = computeTextSimilarity(listing);
   const riskResult = computeRiskHeuristic(listing);
 
-  // Image similarity may fail — gracefully returns null
-  let imageSim: number | null = null;
-  try {
-    imageSim = await computeImageSimilarity(listing.imageUrl, listing.id, budget);
-  } catch {
-    // Signal failed — continue scoring with remaining signals
-  }
-
-  const signals: SignalScores = {
-    brandMention: brandResult.score,
-    textSimilarity: textResult.score,
-    imageSimilarity: imageSim,
-    riskHeuristic: riskResult.score,
+  return {
+    parts: {
+      brandMention: brandResult.score,
+      textSimilarity: textResult.score,
+      riskHeuristic: riskResult.score,
+    },
+    reasons: [brandResult.reason, textResult.reason, riskResult.reason],
   };
+}
 
-  const { totalScore, reasons } = aggregateScore(signals, [
-    brandResult.reason,
-    textResult.reason,
-    riskResult.reason,
-  ]);
+function assemble(
+  listing: MarketplaceResult,
+  base: BaseSignals,
+  imageSimilarity: number | null,
+  imageStatus: ScoredResult["imageStatus"]
+): ScoredResult {
+  const signals: SignalScores = { ...base.parts, imageSimilarity };
+  const { totalScore, reasons } = aggregateScore(signals, base.reasons);
 
   return {
     result: listing,
@@ -53,5 +62,44 @@ export async function scoreResult(
     signals,
     reasons,
     scoredAt: Date.now(),
+    imageStatus,
   };
+}
+
+/**
+ * Score a listing using only the three instant signals (brand, text, risk).
+ * Image similarity is left null; `imageStatus` indicates whether it is expected
+ * to be filled in later ("pending") or will never run ("skipped").
+ *
+ * This is synchronous and cheap, so every scraped listing can be posted to the
+ * UI immediately rather than waiting behind slow CLIP inference.
+ */
+export function scoreBase(
+  listing: MarketplaceResult,
+  imageStatus: "pending" | "skipped"
+): ScoredResult {
+  return assemble(listing, computeBaseSignals(listing), null, imageStatus);
+}
+
+/**
+ * Re-score a listing including the image-similarity signal. Recomputing the
+ * (instant) base signals here keeps the call self-contained; the cost is
+ * negligible next to the CLIP embedding.
+ *
+ * Image similarity failures degrade gracefully (signal stays null), and because
+ * image acts as a one-directional floor, a missing image never lowers the score.
+ */
+export async function scoreResult(
+  listing: MarketplaceResult,
+  budget: RequestBudget
+): Promise<ScoredResult> {
+  const base = computeBaseSignals(listing);
+
+  const { imageSimilarity, fetched } = await analyzeListingImage(
+    listing.imageUrl,
+    listing.id,
+    budget
+  );
+
+  return assemble(listing, base, imageSimilarity, fetched ? "scored" : "failed");
 }

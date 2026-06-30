@@ -50,6 +50,22 @@ export function addResult(id: string, result: ScoredResult): void {
   job.results.push(result);
 }
 
+/**
+ * Insert a result, or replace the existing one with the same listing id.
+ * Used to enrich a previously-posted base score with the image signal in place,
+ * so the result doesn't disappear or duplicate when its image finishes scoring.
+ */
+export function upsertResult(id: string, result: ScoredResult): void {
+  const job = store.get(id);
+  if (!job) return;
+  const idx = job.results.findIndex(
+    (r) => r.result.id === result.result.id &&
+      r.result.marketplace === result.result.marketplace
+  );
+  if (idx >= 0) job.results[idx] = result;
+  else job.results.push(result);
+}
+
 export function updateRequestCounts(id: string, counts: RequestCounts): void {
   const job = store.get(id);
   if (!job) return;

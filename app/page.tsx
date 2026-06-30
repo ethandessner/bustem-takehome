@@ -54,7 +54,7 @@ const SIGNAL_WEIGHTS: Record<string, string> = {
 const SIGNAL_CONTEXT: Record<string, string> = {
   brandMention:    "Base weight 45%. Tiers: 0 = not found · 30 = distant fuzzy match · 65 = close typo · 80 = in description · 100 = exact in title",
   textSimilarity:  "Base weight 30%. Jaccard word-token overlap vs Comfrt product names. Short titles max out ~40–50%; 15%+ is a meaningful match.",
-  imageSimilarity: "One-directional floor (raises score only, never lowers). Calibrated CLIP embedding similarity: 0 = unrelated, 100 = strong visual/semantic match.",
+  imageSimilarity: "One-directional floor (raises score only, never lowers). Calibrated CLIP embedding tuned as a near-duplicate detector: 0 = generic apparel, 100 = reused/near-identical Comfrt photo.",
   riskHeuristic:   "Base weight 25%. Rule-triggered tiers: 0 = no flags · 35 = unverified seller · 55 = below-retail price · 70–85 = suspicious seller / terms",
 };
 
@@ -132,7 +132,7 @@ function SignalBar({ value, label, weight, context }: { value: number | null; la
 
 function ResultCard({ item }: { item: ScoredResult }) {
   const [expanded, setExpanded] = useState(false);
-  const { result, totalScore, signals, reasons } = item;
+  const { result, totalScore, signals, reasons, imageStatus } = item;
 
   // Pick the 2 most informative reasons to preview in the collapsed card.
   // Filter out trivial/null signals, then sort by score descending.
@@ -190,6 +190,9 @@ function ResultCard({ item }: { item: ScoredResult }) {
               <span className="text-gray-500 italic">Price N/A</span>
             )}
             <span className="text-gray-600 truncate max-w-56">{result.sellerName}</span>
+            {imageStatus === "pending" && (
+              <span className="text-blue-600 text-[11px] animate-pulse">⏳ scoring image…</span>
+            )}
           </div>
 
           {/* Top-contributing reasons preview */}
@@ -246,9 +249,21 @@ function ResultCard({ item }: { item: ScoredResult }) {
                 value={signals[key as keyof typeof signals] as number | null}
               />
             ))}
-            {signals.imageSimilarity === null && (
+            {signals.imageSimilarity === null && imageStatus === "pending" && (
+              <p className="text-[11px] text-blue-700 bg-blue-50 border border-blue-200 rounded px-2 py-1.5 mt-1">
+                ⏳ Scoring image similarity… this result will update automatically when the CLIP embedding finishes.
+              </p>
+            )}
+            {signals.imageSimilarity === null && imageStatus === "skipped" && (
+              <p className="text-[11px] text-gray-600 bg-gray-50 border border-gray-200 rounded px-2 py-1.5 mt-1">
+                Image similarity skipped — {result.imageUrl
+                  ? "brand/text/risk signals were already conclusive, so CLIP time was reserved for borderline listings"
+                  : "no listing image was available"}. Image similarity can only raise a score, so skipping it never lowers this one.
+              </p>
+            )}
+            {signals.imageSimilarity === null && imageStatus === "failed" && (
               <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1.5 mt-1">
-                ⚠ Image similarity unavailable — image could not be fetched or budget was exhausted. The score is based on brand, text, and risk signals only; image similarity can only raise a score, so a missing image never lowers it.
+                ⚠ Image similarity unavailable — the image could not be fetched. The score is based on brand, text, and risk signals only; image similarity can only raise a score, so a missing image never lowers it.
               </p>
             )}
           </div>
@@ -372,7 +387,10 @@ export default function Home() {
     switch (sortKey) {
       case "score-desc":    return b.totalScore - a.totalScore;
       case "score-asc":     return a.totalScore - b.totalScore;
-      case "marketplace":   return a.result.marketplace.localeCompare(b.result.marketplace);
+      case "marketplace": {
+        const byMarket = a.result.marketplace.localeCompare(b.result.marketplace);
+        return byMarket !== 0 ? byMarket : b.totalScore - a.totalScore;
+      }
       case "price-asc":     return a.result.price - b.result.price;
     }
   });

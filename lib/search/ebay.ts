@@ -49,21 +49,47 @@ interface EbaySearchResponse {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Upper bound for a plausible single-item apparel price. ScraperAPI sometimes
+ * merges two prices (a strikethrough/original + sale price, or a variation
+ * range) into one field, concatenating the digits — e.g. "$19.99" + "$35" comes
+ * back as `{ value: 199935, currency: "$$" }`. Such values blow past this cap,
+ * so we treat them (and any other implausible number) as "price unknown" (0)
+ * rather than letting a fake six-figure price pollute display + risk scoring.
+ */
+const MAX_PLAUSIBLE_PRICE = 5000;
+
+/**
+ * A normal currency is a single symbol ("$") or an ISO code ("USD"). When
+ * ScraperAPI concatenates two prices it also doubles the symbol ("$$", "££"),
+ * which is a reliable tell that the numeric `value` is corrupted.
+ */
+function isMergedPriceArtifact(currency?: string): boolean {
+  if (!currency) return false;
+  return /^([^\w\s])\1+$/.test(currency.trim());
+}
+
+function sanitizePrice(n: number): number {
+  return isFinite(n) && n > 0 && n <= MAX_PLAUSIBLE_PRICE ? n : 0;
+}
+
 function parsePrice(
   raw: EbayItemPrice | string | number | null | undefined
 ): number {
   if (raw === null || raw === undefined) return 0;
-  if (typeof raw === "number") return isFinite(raw) ? raw : 0;
+  if (typeof raw === "number") return sanitizePrice(raw);
   if (typeof raw === "string") {
     // Strip currency symbols and commas; handle ranges like "19.99 to 29.99"
     const cleaned = raw.replace(/[^0-9.]/g, " ").trim().split(/\s+/)[0];
-    const n = parseFloat(cleaned);
-    return isFinite(n) ? n : 0;
+    return sanitizePrice(parseFloat(cleaned));
   }
-  // Object form: prefer a direct value, otherwise fall back to the low end of
-  // a price range so risk heuristics see the most aggressive (lowest) price.
+  // Object form. A doubled currency symbol means two prices were merged and the
+  // numeric value is unrecoverable, so treat it as unknown.
+  if (isMergedPriceArtifact(raw.currency)) return 0;
+  // Prefer a direct value, otherwise fall back to the low end of a price range
+  // so risk heuristics see the most aggressive (lowest) price.
   const value = raw.value ?? raw.from?.value;
-  return typeof value === "number" && isFinite(value) ? value : 0;
+  return typeof value === "number" ? sanitizePrice(value) : 0;
 }
 
 /** Extract the numeric eBay item id from a listing URL (used as the dedup key). */
