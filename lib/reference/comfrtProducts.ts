@@ -66,23 +66,6 @@ export const COMFRT_PRICE_FLOOR = 30;
  * stale URLs will not crash the scoring pipeline.
  */
 export const COMFRT_REFERENCE_IMAGES: string[] = [
-  // Sunwashed Hoodie
-  // "https://cdn.shopify.com/s/files/1/0569/4029/8284/files/103_3aaa2341-c9d6-4708-b69e-c385fccc0402.jpg",
-  // // Halo Lightweight Oversized Hoodie
-  // "https://cdn.shopify.com/s/files/1/0569/4029/8284/files/19_8.jpg",
-  // // VIP Exclusive Tranquil Hoodie
-  // "https://cdn.shopify.com/s/files/1/0569/4029/8284/files/1-2026-06-15T093805.430.jpg",
-  // // VIP Exclusive Signature Hoodie
-  // "https://cdn.shopify.com/s/files/1/0569/4029/8284/files/1-2026-06-15T090206.603.jpg",
-  // // VIP Exclusive Cloud Zip Hoodie
-  // "https://cdn.shopify.com/s/files/1/0569/4029/8284/files/1_18e3d5de-aea0-472f-b246-fb2b01b49f16.jpg",
-  // // Sunwashed Crew (crewneck sweatshirt)
-  // "https://cdn.shopify.com/s/files/1/0569/4029/8284/files/97_b07e815c-c5fa-488b-987b-a54ef45e1e99.jpg",
-  // // Snak Hoodie
-  // "https://cdn.shopify.com/s/files/1/0569/4029/8284/files/1_e32c0076-6e6c-4992-89e6-f138f86a694f.jpg",
-  // // Sunwashed Straight Leg Sweatpants
-  // "https://cdn.shopify.com/s/files/1/0569/4029/8284/files/139_c62773e1-e73a-4340-aa2e-d3698bcbef6b.jpg",
-
   // Minimalist Hoodie Red
   "https://comfrt.com/fast-image/comfrt/files/1_-_2026-06-10T101635.454.jpg?v=1781111883",
 

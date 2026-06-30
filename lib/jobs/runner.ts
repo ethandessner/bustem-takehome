@@ -12,7 +12,7 @@ import { addMarketplaceError, addResult, setBudgetExhausted, updateJobStatus, up
  * 60 search requests (10 queries × 3 pages × 2 markets) plus per-listing image
  * fetches share this budget; searches run first, the rest goes to image scoring.
  */
-export const REQUEST_BUDGET = 120;
+export const REQUEST_BUDGET = 500;
 
 /**
  * Searches and scoring run on SEPARATE concurrency lanes so that scoring can
