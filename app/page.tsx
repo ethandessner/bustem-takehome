@@ -54,7 +54,7 @@ const SIGNAL_WEIGHTS: Record<string, string> = {
 const SIGNAL_CONTEXT: Record<string, string> = {
   brandMention:    "Base weight 45%. Tiers: 0 = not found · 30 = distant fuzzy match · 65 = close typo · 80 = in description · 100 = exact in title",
   textSimilarity:  "Base weight 30%. Jaccard word-token overlap vs Comfrt product names. Short titles max out ~40–50%; 15%+ is a meaningful match.",
-  imageSimilarity: "One-directional floor (raises score only, never lowers). Calibrated dHash + aHash: 0 = unrelated, 100 = near-identical photo.",
+  imageSimilarity: "One-directional floor (raises score only, never lowers). Calibrated CLIP embedding similarity: 0 = unrelated, 100 = strong visual/semantic match.",
   riskHeuristic:   "Base weight 25%. Rule-triggered tiers: 0 = no flags · 35 = unverified seller · 55 = below-retail price · 70–85 = suspicious seller / terms",
 };
 
@@ -295,13 +295,29 @@ export default function Home() {
   }, []);
 
   const startPolling = useCallback(
-    (id: string) => {
+    async (id: string) => {
       stopPolling();
       startTimeRef.current = Date.now();
 
       timerRef.current = setInterval(() => {
         setElapsedMs(Date.now() - startTimeRef.current);
       }, 500);
+
+      // Fetch immediately so the job state (and disabled button) is set before
+      // isStarting resets to false — no gap where the button is clickable again.
+      try {
+        const res = await fetch(`/api/jobs/${id}`);
+        if (res.ok) {
+          const data: SearchJob = await res.json();
+          setJob(data);
+          if (data.status === "complete" || data.status === "error") {
+            stopPolling();
+            return;
+          }
+        }
+      } catch {
+        // Continue to interval polling even if the immediate fetch fails
+      }
 
       pollRef.current = setInterval(async () => {
         try {

@@ -364,7 +364,7 @@ export function aggregateScore(
     allReasons.push({
       signal: "imageSimilarity",
       score: signals.imageSimilarity,
-      explanation: `Visual hash comparison: ${imgPct}% similarity to closest Comfrt reference image.`,
+      explanation: `CLIP visual similarity: ${imgPct}% match to closest Comfrt reference image.`,
     });
 
     // One-directional floor: image evidence only raises the score.
@@ -373,7 +373,7 @@ export function aggregateScore(
       allReasons.push({
         signal: "imageSimilarity",
         score: signals.imageSimilarity,
-        explanation: `Visual match (${imgPct}%) to a Comfrt product image raised the score to ${imageFloor}, outweighing weak brand/text signals.`,
+        explanation: `Strong visual match (${imgPct}%) to a Comfrt product image raised the score to ${imageFloor}, outweighing weak brand/text signals.`,
       });
       totalScore = imageFloor;
     }
