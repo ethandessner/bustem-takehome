@@ -14,6 +14,8 @@ npm run dev
 Open [http://localhost:3000](http://localhost:3000) and click **Start Search Job**.
 
 > **Requires Node 18+.** The app calls [ScraperAPI](https://www.scraperapi.com/) for structured Amazon and eBay results. An API key is embedded in `lib/search/amazon.ts` and `lib/search/ebay.ts` for convenience — in a real project this would live in `.env.local`.
+>
+> On the first run, the CLIP image model (~90 MB, quantized) is downloaded once by `@huggingface/transformers` and cached on disk. Subsequent runs reuse the cache.
 
 ---
 
@@ -21,11 +23,11 @@ Open [http://localhost:3000](http://localhost:3000) and click **Start Search Job
 
 1. **Start** — clicking "Start Search Job" sends `POST /api/jobs/start`, which creates a job record and fires the runner as a background async task (fire-and-forget, not blocking the HTTP response).
 
-2. **Poll** — the browser polls `GET /api/jobs/[jobId]` every 1.5 s and re-renders the page as results arrive.
+2. **Poll** — the browser fetches the job immediately, then polls `GET /api/jobs/[jobId]` every 1.5 s and re-renders as results arrive.
 
-3. **Run** — the runner executes all search queries concurrently (up to 5 in-flight at once), deduplicates listings, scores each one, and streams results into the in-memory job store.
+3. **Run** — the runner executes search queries and per-listing scoring on **two separate concurrency lanes** (see below), deduplicates listings, and **streams each result into the job store the moment it is scored and ranked** — not in a batch at the end.
 
-4. **Complete** — when all queries finish (or the request budget is exhausted), the job transitions to `complete`. The UI stops polling.
+4. **Complete** — the job transitions to `complete` when all queries finish, the request budget is exhausted, or the wall-clock deadline is reached. The UI stops polling.
 
 The job store is a plain `Map` on `globalThis`, which survives Next.js hot reloads in development.
 
@@ -50,41 +52,54 @@ Each query runs on **both Amazon and eBay**, across **page 1 and page 2**, produ
 
 ## How deduplication works
 
-The runner maintains two `Set`s per job — one for Amazon ASINs and one for eBay item IDs. When a listing appears in multiple query results (e.g. the same hoodie surfaces for both "comfrt hoodie" and "comfrt pullover"), it is scored exactly once. Subsequent encounters are silently skipped.
+The runner maintains two `Set`s per job — one for Amazon ASINs and one for eBay item IDs (the eBay item id is parsed out of the listing's `/itm/<id>` URL, since the structured endpoint has no dedicated id field). When a listing appears in multiple query results (e.g. the same hoodie surfaces for both "comfrt hoodie" and "comfrt pullover"), it is scored exactly once. Subsequent encounters are skipped at schedule time, so duplicates never even consume a scoring slot.
 
 ---
 
 ## Scoring signals
 
-Each listing is scored 0–100 across four independent signals, then combined with a weighted average:
+Each listing is scored with four independent signals. The final score is a 0–100 number (the 0–1 infringement probability × 100).
 
-| Signal | Weight | How it works |
+| Signal | Role | How it works |
 |---|---|---|
-| **Brand Mention** | 30% | Exact string match for "comfrt" in title → 1.0; in brand/description → 0.8; fuzzy (edit-distance 1) → 0.65; fuzzy (edit-distance 2) → 0.3; known legitimate brand (Nike, Adidas, etc.) → 0.0 |
-| **Text Similarity** | 20% | Jaccard token-overlap between the listing title and every known Comfrt product name and keyword. Returns the best match score (0–1). |
-| **Image Similarity** | 35% | Fetches the listing image, computes a 64-bit difference hash (dHash via `sharp`), then measures Hamming distance against 8 reference Comfrt product images. Returns the best similarity (0–1), or `null` if the image could not be fetched. |
-| **Risk Heuristic** | 15% | Combines three sub-signals: (1) price anomaly — apparel priced below $20 → 0.85, below $30 → 0.55; (2) suspicious title terms — "dupe", "replica", "inspired by", etc. → 0.75; (3) suspicious seller patterns — "dropship", "wholesale", "factory", etc. → 0.70; digits in seller name → 0.35. |
+| **Brand Mention** | Base weight **45%** | Exact "comfrt" in title → 1.0; in brand/description → 0.8; fuzzy match by Levenshtein edit-distance 1 → 0.65, distance 2 → 0.3; known legitimate brand (Nike, Adidas, etc.) → 0.0 |
+| **Text Similarity** | Base weight **30%** | Jaccard token-overlap between the listing title and every known Comfrt product name and keyword. Returns the best match (0–1). |
+| **Risk Heuristic** | Base weight **25%** | Combines price anomaly (apparel < $20 → 0.85, < $30 → 0.55), suspicious title terms ("dupe", "replica", "inspired by", …) → 0.75, suspicious seller patterns ("dropship", "wholesale", "factory", …) → 0.70, and digits-in-seller-name → 0.35. The explanation lists every trigger. |
+| **Image Similarity** | One-directional **floor** | Embeds the listing image with **CLIP (ViT-B/32)** via `@huggingface/transformers`, then takes the max cosine similarity against the cached Comfrt reference-image embeddings. Calibrated so only genuinely close visual matches score high (see below). Returns `null` if the image can't be fetched. |
 
 ### Final score calculation
 
 ```
-score = brandMention×0.30 + textSimilarity×0.20 + imageSimilarity×0.35 + riskHeuristic×0.15
+base  = (brandMention×0.45 + textSimilarity×0.30 + riskHeuristic×0.25)   // renormalised to sum to 1
+score = max(base, imageSimilarity × 0.95)                                // image only RAISES the score
 ```
 
-If `imageSimilarity` is `null` (fetch failed or budget exhausted), its 35% weight is redistributed proportionally among the other three signals so the total always sums to 100%. The final score is multiplied by 100 and rounded to the nearest integer.
+Brand, text, and risk form a renormalised weighted average — these are *symmetric* signals where a low value genuinely points toward a legitimate listing. **Image similarity is treated asymmetrically:** a high value is strong proof a listing reuses a Comfrt photo, but a low value is uninformative (counterfeiters shoot their own photos). So image similarity is applied as a one-directional **floor** — it can only push the score *up*, never dilute it. This lets a brandless counterfeit with a copied photo still get flagged, while a genuine listing whose photo simply doesn't match keeps its brand/text/risk score instead of being dragged down.
+
+If `imageSimilarity` is `null` (fetch failed or budget/deadline reached), it's simply skipped — the base score stands, and the UI notes that the image signal was unavailable.
+
+**Why CLIP instead of a perceptual hash?** A pHash/dHash only matches near-identical *pixels*. CLIP embeddings capture *semantic* content, so a counterfeit shot from a different angle, on a different model, against a different background still lands close to the reference in embedding space. Because any hoodie scores ~0.80 cosine against a Comfrt hoodie, the raw cosine is calibrated with a noise floor of 0.78 and a match ceiling of 0.90 (`lib/scoring/imageSimilarity.ts`) so only genuinely close matches drive the score up.
 
 **Interpreting scores:**
 - **≥ 75** — High risk (likely infringing)
 - **45–74** — Medium risk (warrants review)
 - **< 45** — Low risk (probably legitimate)
 
+### Explainability
+
+Every result exposes three things in the UI: the final score, the top human-readable contributing reasons (previewed on the card), and the raw per-signal values with weights in the expandable "Show signals" view for inspection/debugging.
+
 ---
 
-## Request budget
+## Orchestration constraints
 
-The runner enforces a soft cap of **200 total outbound requests** per job (24 search + up to ~176 image fetches). When the budget is reached, remaining listings are skipped and the UI shows a "Request budget reached" notice. This prevents runaway costs on a shared API key.
+**Two concurrency lanes.** Searches and scoring run on independent semaphores (`lib/utils/concurrency.ts`): up to **4** in-flight searches and **6** in-flight scoring tasks. Keeping them separate is what makes results stream — scoring a freshly scraped listing starts immediately rather than waiting behind every remaining search — and it avoids the deadlock a single shared lane would create.
 
-Concurrency is capped at **5 simultaneous in-flight requests** via a queue-based semaphore (`lib/utils/concurrency.ts`).
+**Soft request budget.** A cap of **250 total outbound requests** per job (24 search + image fetches for scoring) is enforced via a counter (`lib/utils/requestBudget.ts`). When reached, remaining listings are skipped and the UI shows a "Request budget reached" notice. Adjust via `REQUEST_BUDGET` in `lib/jobs/runner.ts`.
+
+**Wall-clock deadline.** A soft **4-minute** deadline (`JOB_DEADLINE_MS`) stops scheduling new search/scoring work once elapsed, so a large budget can't let a job run indefinitely. In-flight tasks finish (their own 15 s fetch timeouts bound the overrun).
+
+**Graceful degradation.** Any single failure is contained: a failed search increments a per-marketplace error counter and is skipped; a failed image fetch returns `null` so the listing is still scored on brand/text/risk. The UI surfaces total elapsed time and request counts broken down by platform (Amazon / eBay / Images / Other).
 
 ---
 
@@ -92,14 +107,12 @@ Concurrency is capped at **5 simultaneous in-flight requests** via a queue-based
 
 **Hardcoded API key** — The ScraperAPI key is in source. For a real deployment it should be an environment variable and rotated regularly.
 
-**In-memory job store** — Jobs are lost on server restart. A Redis or Postgres-backed store would be needed for production.
+**In-memory job store** — Jobs are lost on server restart. A Redis or Postgres-backed store would be needed for production (see `ARCHITECTURE.md`).
 
 **No auth** — Any user can start a job and exhaust the request budget. A real system would require authentication and per-user rate limiting.
 
-**Reference image URLs** — The 8 Shopify CDN URLs in `lib/reference/comfrtProducts.ts` were collected manually. If they rotate (CDN cache busting, product updates), image similarity silently degrades to `null` and the weight is redistributed. New URLs can be obtained by right-clicking product images on [comfrt.com](https://comfrt.com).
+**Reference image URLs** — The reference image URLs in `lib/reference/comfrtProducts.ts` were collected manually from the Comfrt Shopify storefront. If they rotate, the affected reference embedding is dropped at load time and image similarity degrades gracefully. New URLs can be obtained from `https://comfrt.com/products.json`.
 
-**dHash sensitivity** — Difference hashing is fast and works well for identical or near-identical images, but can return false negatives when sellers use different product photos (different angle, background, crop). A cloud Vision API or embedding-based similarity would be more robust.
+**CLIP runs in-process** — Embedding inference runs on the Node.js event loop. At high concurrency or with slow upstreams this can delay poll responses. A real system would run scoring in a separate worker (see `ARCHITECTURE.md`).
 
-**No feedback loop** — Scores are not validated against human review. False-positive and false-negative rates are unknown. See `ARCHITECTURE.md` for how a feedback loop would work at scale.
-
-**Single process** — The background runner blocks the Node.js event loop proportionally. At high concurrency or with slow upstream APIs this can cause 1.5 s poll responses to queue up. A real system would run the runner in a separate worker process or queue.
+**No feedback loop** — Scores are not validated against human review, so false-positive/negative rates are unknown. `ARCHITECTURE.md` describes how a labeling + recalibration loop would work at scale.

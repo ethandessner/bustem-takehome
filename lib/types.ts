@@ -46,7 +46,7 @@ export interface SignalScores {
   brandMention: number;
   /** 0–1 — token overlap with known Comfrt product names. Base weight: 0.30 */
   textSimilarity: number;
-  /** 0–1 — calibrated perceptual hash (dHash+aHash) vs reference images; null if fetch failed.
+  /** 0–1 — calibrated CLIP embedding similarity vs reference images; null if fetch failed.
    *  Applied as a one-directional floor (raises score only), not a weighted term. */
   imageSimilarity: number | null;
   /** 0–1 — price anomaly + suspicious title/seller signals combined. Base weight: 0.25 */

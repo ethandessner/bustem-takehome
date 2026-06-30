@@ -6,23 +6,41 @@ const TIMEOUT_MS = 30_000;
 
 // ---------------------------------------------------------------------------
 // ScraperAPI response shapes
+//
+// The structured eBay v2 endpoint returns a different shape than the Amazon
+// endpoint. Items live under `results` (not `organic_results`), the title is
+// `product_title`, the URL is `product_url`, the image is `image`, and the
+// price is an object (`{ value, currency }` or a `{ from, to }` range) rather
+// than a string. There is no dedicated item-id field — the numeric item id is
+// embedded in `product_url` (e.g. https://www.ebay.com/itm/168247687486).
 // ---------------------------------------------------------------------------
 
+interface EbayPriceValue {
+  value?: number;
+  currency?: string;
+}
+
+interface EbayItemPrice {
+  value?: number;
+  currency?: string;
+  from?: EbayPriceValue;
+  to?: EbayPriceValue;
+}
+
 interface EbayRawItem {
-  item_id?: string;
-  title?: string;
-  price?: string | number | null;
-  currency_symbol?: string;
-  image_url?: string;
-  item_url?: string;
-  seller_name?: string;
+  product_title?: string;
+  image?: string;
+  product_url?: string;
+  item_price?: EbayItemPrice | string | number | null;
   condition?: string;
-  buying_format?: string;
-  shipping?: string;
+  seller_name?: string;
+  extra_info?: string;
+  shipping_cost?: string;
+  shipping_location?: string;
 }
 
 interface EbaySearchResponse {
-  organic_results?: EbayRawItem[];
+  results?: EbayRawItem[];
   error?: string;
   message?: string;
 }
@@ -31,26 +49,42 @@ interface EbaySearchResponse {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function parsePrice(raw: string | number | null | undefined): number {
-  if (raw === null || raw === undefined || raw === "") return 0;
+function parsePrice(
+  raw: EbayItemPrice | string | number | null | undefined
+): number {
+  if (raw === null || raw === undefined) return 0;
   if (typeof raw === "number") return isFinite(raw) ? raw : 0;
-  // Strip currency symbols and commas; handle ranges like "19.99 to 29.99"
-  const cleaned = String(raw).replace(/[^0-9.]/g, " ").trim().split(/\s+/)[0];
-  const n = parseFloat(cleaned);
-  return isFinite(n) ? n : 0;
+  if (typeof raw === "string") {
+    // Strip currency symbols and commas; handle ranges like "19.99 to 29.99"
+    const cleaned = raw.replace(/[^0-9.]/g, " ").trim().split(/\s+/)[0];
+    const n = parseFloat(cleaned);
+    return isFinite(n) ? n : 0;
+  }
+  // Object form: prefer a direct value, otherwise fall back to the low end of
+  // a price range so risk heuristics see the most aggressive (lowest) price.
+  const value = raw.value ?? raw.from?.value;
+  return typeof value === "number" && isFinite(value) ? value : 0;
+}
+
+/** Extract the numeric eBay item id from a listing URL (used as the dedup key). */
+function extractItemId(url: string | undefined): string | null {
+  if (!url) return null;
+  const match = url.match(/\/itm\/(\d+)/);
+  return match ? match[1] : null;
 }
 
 function normalizeResult(raw: EbayRawItem): MarketplaceResult | null {
-  if (!raw.item_id || !raw.title) return null;
+  const id = extractItemId(raw.product_url);
+  if (!id || !raw.product_title) return null;
   return {
-    id: raw.item_id,
+    id,
     marketplace: "ebay",
-    title: raw.title,
-    price: parsePrice(raw.price),
+    title: raw.product_title,
+    price: parsePrice(raw.item_price),
     currency: "USD",
     sellerName: raw.seller_name ?? "Unknown",
-    listingUrl: raw.item_url ?? `https://www.ebay.com/itm/${raw.item_id}`,
-    imageUrl: raw.image_url ?? undefined,
+    listingUrl: raw.product_url ?? `https://www.ebay.com/itm/${id}`,
+    imageUrl: raw.image ?? undefined,
     fetchedAt: Date.now(),
   };
 }
@@ -90,7 +124,7 @@ export async function searchEbay(
     throw new Error(`eBay search API error: ${data.error ?? data.message}`);
   }
 
-  const rawItems: EbayRawItem[] = data.organic_results ?? [];
+  const rawItems: EbayRawItem[] = data.results ?? [];
 
   return rawItems.flatMap((r) => {
     const normalized = normalizeResult(r);

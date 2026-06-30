@@ -1,137 +1,131 @@
-import sharp from "sharp";
+import {
+  AutoProcessor,
+  CLIPVisionModelWithProjection,
+  RawImage,
+} from "@huggingface/transformers";
 import type { RequestBudget } from "../utils/requestBudget";
 import { COMFRT_REFERENCE_IMAGES } from "../reference/comfrtProducts";
 
 // ---------------------------------------------------------------------------
-// Perceptual hashing (dHash + aHash)
+// CLIP image-embedding similarity
 //
-// We combine two complementary perceptual hashes for a stronger, less noisy
-// match than a single 64-bit dHash:
+// We embed each image with CLIP (ViT-B/32) and compare listing images to the
+// Comfrt reference images by cosine similarity of their embeddings.
 //
-//   • dHash (difference hash) — captures gradient/edge structure. Resize to
-//     (N+1)×N grayscale, compare each pixel to its right neighbour → N×N bits.
-//   • aHash (average hash)    — captures coarse tonal layout. Resize to N×N
-//     grayscale, compare each pixel to the frame mean → N×N bits.
+// Unlike a perceptual hash (which only matches near-identical *pixels*), CLIP
+// embeddings capture *semantic* content — so a counterfeit photographed from a
+// different angle, on a different model, against a different background still
+// lands close to the reference in embedding space. This is what lets us catch
+// "same style of garment, different photo" rip-offs that hashing misses.
 //
-// Using N=16 gives 256 bits per hash (512 combined), which discriminates far
-// better than the old 64-bit dHash. The two hash bit-arrays are concatenated
-// and compared with a single Hamming distance.
-//
-// Raw Hamming similarity has a high noise floor: two *unrelated* images still
-// agree on ~50% of bits by chance. We therefore calibrate the raw similarity
-// (see calibrateSimilarity) so the noise baseline maps to ~0 and only genuine
-// visual matches produce a high signal.
+// The model runs locally via onnxruntime-node (no external API / key). Weights
+// are downloaded once on first use and cached on disk by transformers.js.
 // ---------------------------------------------------------------------------
 
-/** Hash grid dimension (N×N bits per hash). */
-const HASH_N = 16;
-const HASH_BITS = HASH_N * HASH_N;
+/** CLIP checkpoint. ViT-B/32 is a good speed/quality balance for similarity. */
+const MODEL_ID = "Xenova/clip-vit-base-patch32";
+/** Quantized weights keep the download small (~90MB) and CPU inference fast. */
+const MODEL_DTYPE = "q8" as const;
 
-/** Concatenated dHash+aHash bits as a Uint8Array of 0/1 values. */
-type PerceptualHash = Uint8Array;
-
-/**
- * Raw similarity below this is treated as noise (unrelated images agree on
- * ~50% of bits by chance) and calibrated to 0.
- */
-const NOISE_FLOOR = 0.6;
-/** Raw similarity at/above this is treated as a confident visual match → 1. */
+// Calibration constants, derived from measured ViT-B/32 cosine spread:
+//   • unrelated (apparel vs non-apparel):        ~0.25–0.31
+//   • same broad category, different garment:    ~0.70–0.83
+//   • near-identical design / reused photo:      ~0.88–1.00
+//
+// Because *any* hoodie scores ~0.80 against a Comfrt hoodie, a low floor would
+// flag all apparel. We set NOISE_FLOOR above the generic same-category band so
+// only genuinely close visual matches drive the score up; a confident match
+// maps to 1. These are the main tuning knobs for image precision/recall.
+const NOISE_FLOOR = 0.78;
 const MATCH_CEILING = 0.9;
 
-/** Rescale raw Hamming similarity so the noise floor maps to 0 and a confident match to 1. */
-function calibrateSimilarity(raw: number): number {
-  const scaled = (raw - NOISE_FLOOR) / (MATCH_CEILING - NOISE_FLOOR);
+function calibrate(cosine: number): number {
+  const scaled = (cosine - NOISE_FLOOR) / (MATCH_CEILING - NOISE_FLOOR);
   return Math.max(0, Math.min(1, scaled));
 }
 
-async function bufferToHash(buffer: Buffer): Promise<PerceptualHash> {
-  const base = sharp(buffer).grayscale();
-
-  // dHash: (N+1)×N, compare horizontally adjacent pixels.
-  const { data: dData } = await base
-    .clone()
-    .resize(HASH_N + 1, HASH_N, { fit: "fill" })
-    .raw()
-    .toBuffer({ resolveWithObject: true });
-
-  // aHash: N×N, compare each pixel to the frame mean.
-  const { data: aData } = await base
-    .clone()
-    .resize(HASH_N, HASH_N, { fit: "fill" })
-    .raw()
-    .toBuffer({ resolveWithObject: true });
-
-  const hash = new Uint8Array(HASH_BITS * 2);
-  let idx = 0;
-
-  for (let row = 0; row < HASH_N; row++) {
-    for (let col = 0; col < HASH_N; col++) {
-      const pixIdx = row * (HASH_N + 1) + col;
-      hash[idx++] = dData[pixIdx] > dData[pixIdx + 1] ? 1 : 0;
-    }
-  }
-
-  let sum = 0;
-  for (let i = 0; i < HASH_BITS; i++) sum += aData[i];
-  const mean = sum / HASH_BITS;
-  for (let i = 0; i < HASH_BITS; i++) {
-    hash[idx++] = aData[i] > mean ? 1 : 0;
-  }
-
-  return hash;
-}
-
-function hammingDistance(a: PerceptualHash, b: PerceptualHash): number {
-  let count = 0;
-  const len = a.length;
-  for (let i = 0; i < len; i++) {
-    if (a[i] !== b[i]) count++;
-  }
-  return count;
-}
-
-/** Calibrated similarity: 1 = confident visual match, 0 = noise/unrelated. */
-function hashSimilarity(a: PerceptualHash, b: PerceptualHash): number {
-  const raw = 1 - hammingDistance(a, b) / a.length;
-  return calibrateSimilarity(raw);
-}
-
 // ---------------------------------------------------------------------------
-// Reference hash cache — computed lazily, once per process lifetime
+// Model + reference-embedding singletons (computed once per process)
 // ---------------------------------------------------------------------------
 
-/** Map from reference image URL to its perceptual hash (or null if it failed to load). */
-const referenceHashCache = new Map<string, PerceptualHash | null>();
+type ClipBundle = {
+  processor: Awaited<ReturnType<typeof AutoProcessor.from_pretrained>>;
+  model: Awaited<ReturnType<typeof CLIPVisionModelWithProjection.from_pretrained>>;
+};
 
-/** Singleton promise so concurrent first-calls don't duplicate the work. */
-let initPromise: Promise<void> | null = null;
+let modelPromise: Promise<ClipBundle> | null = null;
 
-async function fetchBuffer(url: string): Promise<Buffer> {
+function getModel(): Promise<ClipBundle> {
+  if (!modelPromise) {
+    modelPromise = (async () => {
+      const [processor, model] = await Promise.all([
+        AutoProcessor.from_pretrained(MODEL_ID),
+        CLIPVisionModelWithProjection.from_pretrained(MODEL_ID, {
+          dtype: MODEL_DTYPE,
+        }),
+      ]);
+      return { processor, model };
+    })();
+  }
+  return modelPromise;
+}
+
+/** Fetch an image with a hard timeout, so a slow/hanging URL can't pin a
+ *  concurrency slot. transformers.js `RawImage.read(url)` has no timeout. */
+async function fetchImage(url: string): Promise<RawImage> {
   const res = await fetch(url, {
     headers: { "User-Agent": "Mozilla/5.0 (compatible; ComfrtBot/1.0)" },
     signal: AbortSignal.timeout(15_000),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status} fetching ${url}`);
-  return Buffer.from(await res.arrayBuffer());
+  return RawImage.fromBlob(await res.blob());
 }
 
-async function initReferenceHashes(): Promise<void> {
-  await Promise.allSettled(
-    COMFRT_REFERENCE_IMAGES.map(async (url) => {
-      try {
-        const buf = await fetchBuffer(url);
-        const hash = await bufferToHash(buf);
-        referenceHashCache.set(url, hash);
-      } catch {
-        // Image unavailable — mark as null; will be skipped during comparison
-        referenceHashCache.set(url, null);
+function l2normalize(vec: Float32Array): Float32Array {
+  let sumSq = 0;
+  for (let i = 0; i < vec.length; i++) sumSq += vec[i] * vec[i];
+  const norm = Math.sqrt(sumSq) || 1;
+  const out = new Float32Array(vec.length);
+  for (let i = 0; i < vec.length; i++) out[i] = vec[i] / norm;
+  return out;
+}
+
+/** Cosine similarity of two L2-normalised vectors (i.e. their dot product). */
+function dot(a: Float32Array, b: Float32Array): number {
+  let sum = 0;
+  const len = Math.min(a.length, b.length);
+  for (let i = 0; i < len; i++) sum += a[i] * b[i];
+  return sum;
+}
+
+async function embed(image: RawImage): Promise<Float32Array> {
+  const { processor, model } = await getModel();
+  const inputs = await processor(image);
+  const output = await model(inputs);
+  const data = output.image_embeds.data as Float32Array;
+  return l2normalize(Float32Array.from(data));
+}
+
+let refEmbeddingsPromise: Promise<Float32Array[]> | null = null;
+
+function getReferenceEmbeddings(): Promise<Float32Array[]> {
+  if (!refEmbeddingsPromise) {
+    refEmbeddingsPromise = (async () => {
+      const settled = await Promise.allSettled(
+        COMFRT_REFERENCE_IMAGES.map(async (url) => {
+          const image = await fetchImage(url);
+          return embed(image);
+        })
+      );
+      const ok: Float32Array[] = [];
+      for (const r of settled) {
+        if (r.status === "fulfilled") ok.push(r.value);
+        else console.warn("[imageSimilarity] reference embed failed:", r.reason);
       }
-    })
-  );
-}
-
-function getValidRefHashes(): PerceptualHash[] {
-  return [...referenceHashCache.values()].filter((h): h is PerceptualHash => h !== null);
+      return ok;
+    })();
+  }
+  return refEmbeddingsPromise;
 }
 
 // ---------------------------------------------------------------------------
@@ -139,17 +133,16 @@ function getValidRefHashes(): PerceptualHash[] {
 // ---------------------------------------------------------------------------
 
 /**
- * Fetches the listing image, computes its perceptual hash (dHash+aHash), and
- * returns the maximum calibrated similarity against all cached reference Comfrt
- * product hashes (0–1).
+ * Embeds the listing image with CLIP and returns the maximum calibrated cosine
+ * similarity against the cached Comfrt reference embeddings (0–1).
  *
- * Returns null if:
+ * Returns null (signal skipped, never penalised) if:
  *  - imageUrl is missing
  *  - the request budget is exhausted
- *  - the image fetch or hash computation fails
+ *  - no reference embeddings are available
+ *  - the image fetch / embedding fails
  *
- * Failure is always graceful — callers should continue scoring with the
- * remaining signals when this returns null.
+ * Failure is always graceful — callers continue scoring with the other signals.
  */
 export async function computeImageSimilarity(
   imageUrl: string | undefined,
@@ -161,36 +154,25 @@ export async function computeImageSimilarity(
 
   budget.consume("image");
 
-  // Lazily initialise reference hashes (no extra budget cost — done once)
-  if (!initPromise) {
-    initPromise = initReferenceHashes();
-  }
-  await initPromise;
-
-  const refHashes = getValidRefHashes();
-  if (refHashes.length === 0) {
-    // No reference images loaded — skip this signal rather than returning 0
-    return null;
-  }
-
-  let listingBuffer: Buffer;
   try {
-    listingBuffer = await fetchBuffer(imageUrl);
-  } catch {
+    const refs = await getReferenceEmbeddings();
+    if (refs.length === 0) return null;
+
+    const image = await fetchImage(imageUrl);
+    const embedding = await embed(image);
+
+    let best = -1;
+    for (const ref of refs) {
+      const sim = dot(embedding, ref);
+      if (sim > best) best = sim;
+    }
+
+    return calibrate(best);
+  } catch (err) {
+    console.warn(
+      "[imageSimilarity] embedding failed:",
+      err instanceof Error ? err.message : err
+    );
     return null;
   }
-
-  let listingHash: PerceptualHash;
-  try {
-    listingHash = await bufferToHash(listingBuffer);
-  } catch {
-    return null;
-  }
-
-  const maxSimilarity = refHashes.reduce(
-    (best, refHash) => Math.max(best, hashSimilarity(listingHash, refHash)),
-    0
-  );
-
-  return maxSimilarity;
 }
